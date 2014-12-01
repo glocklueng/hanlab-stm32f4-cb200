@@ -1,0 +1,778 @@
+#include "main.h"
+#include "myprotocol.h"
+
+//#define __CTRL_MSG_HAVE_BODY__
+
+#define SOX                 0xA0
+#define EOX                 0xC0
+#define ESC                 0xE0
+
+#define MSG_TYPE_ACK        0x1C
+#define MSG_TYPE_NAK        0x18
+#define MSG_TYPE_REQ_CONN   0x14
+#define MSG_TYPE_CONN       0x10
+
+#define GetMsgType(type_and_size)           ((type_and_size)&0x60 ? (type_and_size)&0x60 : (type_and_size)&0x1C)
+#define GetMsgSize(type_and_size)           ((type_and_size)&0x60 ? (type_and_size)&0x1F : (type_and_size)&0x03)
+#ifdef __CTRL_MSG_HAVE_BODY__
+#define MsgTypeIsCtrl(type_and_size)        (!((type_and_size)&0x60) && (type_and_size)&0x1C)
+#else
+#define MsgTypeIsCtrl(type_and_size)        (!((type_and_size)&0x63) && (type_and_size)&0x1C)
+#endif
+
+#define MsgTypeIsData(type_and_size)        ((type_and_size)&0x60)
+
+#define RESEND_ALL_MSG_IN_Q      127
+
+#define EXPECTED_NEXT_SEQ        ((last_recv_seq+1)%ARRAYSIZE(DataMsgTxQ))
+
+//----------------------------------------------------------------
+
+struct DataMessage
+{
+    unsigned char type_and_size;
+    unsigned char seq;
+    unsigned char data[DATA_MSG_MAX_LEN];
+    unsigned char crc8;
+};
+
+struct CtrlMessage
+{
+    unsigned char type_and_size;
+    unsigned char seq;
+    unsigned char crc8;
+};
+
+//----------------------------------------------------------------
+
+static volatile bool MsgConnect = false;
+static volatile bool MsgSendIrqIsOver = true;
+
+static volatile int DataMsgTxQSendPos = 0;
+
+static CQ_DEFINE(struct DataMessage, DataMsgTxQ, 30);
+static CQ_DEFINE(struct CtrlMessage, CtrlMsgTxQ, 10);
+
+#ifdef __DATA1_STREAM__
+static CQ_DEFINE(unsigned char, MsgRxCh1Buf, 1000);
+#else
+static CQ_DEFINE(struct RxMsg, MsgRxCh1Buf, 100);
+#endif
+
+#ifdef __DATA2_STREAM__
+static CQ_DEFINE(unsigned char, MsgRxCh2Buf, 1000);
+#else
+static CQ_DEFINE(struct RxMsg, MsgRxCh2Buf, 100);
+#endif
+
+#ifdef __DATA3_STREAM__
+static CQ_DEFINE(unsigned char, MsgRxCh3Buf, 1000);
+#else
+static CQ_DEFINE(struct RxMsg, MsgRxCh3Buf, 100);
+#endif
+
+//----------------------------------------------------------------
+
+void MsgInit(void);
+    bool MsgServiceIsConnected(void);
+
+void MsgRecvIrqHandler(int ch);
+void MsgSendIrqHandler(void);
+    static void MsgSendHandler(void);
+    static unsigned char crc8(void const* buf, int len);
+    static void MsgWriteToDMA(unsigned char* buf, int len);
+
+int MsgSend(int type, void* sendbuf, int bufsize);
+int MsgRecv(int data_channel, void* recvbuf, int bufsize);
+struct RxMsg* MsgRecvPacket(int data_channel);
+
+//----------------------------------------------------------------
+
+void MsgWriteToDMA(unsigned char* buf, int len)
+{
+    if ( MsgSendIrqIsOver == true )
+    {
+        MsgSendIrqIsOver = false;
+        HAL_UART_Transmit_DMA(LCD_UART, buf, len);
+    }
+}
+
+bool MsgServiceIsConnected(void)
+{
+    return MsgConnect;
+}
+
+unsigned char crc8(void const* buf, int len)
+{
+    const unsigned char crc8_table[256] = {  // polynomial 0x8c (mirror of 0x31)
+        0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83,
+        0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
+        0x9d, 0xc3, 0x21, 0x7f, 0xfc, 0xa2, 0x40, 0x1e,
+        0x5f, 0x01, 0xe3, 0xbd, 0x3e, 0x60, 0x82, 0xdc,
+        0x23, 0x7d, 0x9f, 0xc1, 0x42, 0x1c, 0xfe, 0xa0,
+        0xe1, 0xbf, 0x5d, 0x03, 0x80, 0xde, 0x3c, 0x62,
+        0xbe, 0xe0, 0x02, 0x5c, 0xdf, 0x81, 0x63, 0x3d,
+        0x7c, 0x22, 0xc0, 0x9e, 0x1d, 0x43, 0xa1, 0xff,
+        0x46, 0x18, 0xfa, 0xa4, 0x27, 0x79, 0x9b, 0xc5,
+        0x84, 0xda, 0x38, 0x66, 0xe5, 0xbb, 0x59, 0x07,
+        0xdb, 0x85, 0x67, 0x39, 0xba, 0xe4, 0x06, 0x58,
+        0x19, 0x47, 0xa5, 0xfb, 0x78, 0x26, 0xc4, 0x9a,
+        0x65, 0x3b, 0xd9, 0x87, 0x04, 0x5a, 0xb8, 0xe6,
+        0xa7, 0xf9, 0x1b, 0x45, 0xc6, 0x98, 0x7a, 0x24,
+        0xf8, 0xa6, 0x44, 0x1a, 0x99, 0xc7, 0x25, 0x7b,
+        0x3a, 0x64, 0x86, 0xd8, 0x5b, 0x05, 0xe7, 0xb9,
+        0x8c, 0xd2, 0x30, 0x6e, 0xed, 0xb3, 0x51, 0x0f,
+        0x4e, 0x10, 0xf2, 0xac, 0x2f, 0x71, 0x93, 0xcd,
+        0x11, 0x4f, 0xad, 0xf3, 0x70, 0x2e, 0xcc, 0x92,
+        0xd3, 0x8d, 0x6f, 0x31, 0xb2, 0xec, 0x0e, 0x50,
+        0xaf, 0xf1, 0x13, 0x4d, 0xce, 0x90, 0x72, 0x2c,
+        0x6d, 0x33, 0xd1, 0x8f, 0x0c, 0x52, 0xb0, 0xee,
+        0x32, 0x6c, 0x8e, 0xd0, 0x53, 0x0d, 0xef, 0xb1,
+        0xf0, 0xae, 0x4c, 0x12, 0x91, 0xcf, 0x2d, 0x73,
+        0xca, 0x94, 0x76, 0x28, 0xab, 0xf5, 0x17, 0x49,
+        0x08, 0x56, 0xb4, 0xea, 0x69, 0x37, 0xd5, 0x8b,
+        0x57, 0x09, 0xeb, 0xb5, 0x36, 0x68, 0x8a, 0xd4,
+        0x95, 0xcb, 0x29, 0x77, 0xf4, 0xaa, 0x48, 0x16,
+        0xe9, 0xb7, 0x55, 0x0b, 0x88, 0xd6, 0x34, 0x6a,
+        0x2b, 0x75, 0x97, 0xc9, 0x4a, 0x14, 0xf6, 0xa8,
+        0x74, 0x2a, 0xc8, 0x96, 0x15, 0x4b, 0xa9, 0xf7,
+        0xb6, 0xe8, 0x0a, 0x54, 0xd7, 0x89, 0x6b, 0x35,
+    };
+
+	register int i;
+    register unsigned char crc = 0;
+    register unsigned char* data = (unsigned char*) buf;
+
+	for ( i=0; i<len; i++, data++ )
+        crc = crc8_table[crc^(*data)];
+
+    return crc;
+}
+
+void MsgInit(void)
+{
+    MsgConnect = false;
+    MsgSendIrqIsOver = true;
+
+    CQ_INIT(DataMsgTxQ);
+    DataMsgTxQSendPos = 0;
+    CQ_INIT(CtrlMsgTxQ);
+
+    CQ_INIT(MsgRxCh1Buf);
+    CQ_INIT(MsgRxCh2Buf);
+    CQ_INIT(MsgRxCh3Buf);
+
+    MsgSend(MSG_TYPE_REQ_CONN, NULL, 0);
+}
+
+int MsgRecv(int data_channel, void* recvbuf, int bufsize)
+{
+    int size = 0;
+    unsigned char* buf = (unsigned char*) recvbuf;
+
+    if ( !MsgConnect )
+        return -2;
+
+    if ( buf==NULL || bufsize<=0 )
+        return -1;
+
+    switch ( data_channel )
+    {
+        case MSG_TYPE_DATA1:
+#ifdef __DATA1_STREAM__
+            size = CQ_USEDSIZE(MsgRxCh1Buf);
+            if ( size > 0 )
+            {
+                if ( bufsize < size ) size = bufsize;
+                CQ_GETBUF(MsgRxCh1Buf, buf, size);
+            }
+#endif
+            break;
+        case MSG_TYPE_DATA2:
+#ifdef __DATA2_STREAM__
+            size = CQ_USEDSIZE(MsgRxCh2Buf);
+            if ( size > 0 )
+            {
+                if ( bufsize < size ) size = bufsize;
+                CQ_GETBUF(MsgRxCh2Buf, buf, size);
+            }
+#endif
+            break;
+        case MSG_TYPE_DATA3:
+#ifdef __DATA3_STREAM__
+            size = CQ_USEDSIZE(MsgRxCh3Buf);
+            if ( size > 0 )
+            {
+                if ( bufsize < size ) size = bufsize;
+                CQ_GETBUF(MsgRxCh3Buf, buf, size);
+            }
+#endif
+            break;
+    }
+
+    return size;
+}
+
+struct RxMsg* MsgRecvPacket(int data_channel)
+{
+    struct RxMsg* ret = NULL;
+    static struct RxMsg msg;
+
+    if ( !MsgConnect )
+        return NULL;
+
+    switch ( data_channel )
+    {
+        case MSG_TYPE_DATA1:
+#ifndef __DATA1_STREAM__
+            if ( CQ_ISNOTEMPTY(MsgRxCh1Buf) )
+            {
+                CQ_GET(MsgRxCh1Buf, msg);
+                ret = &msg;
+            }
+#endif
+            break;
+        case MSG_TYPE_DATA2:
+#ifndef __DATA2_STREAM__
+            if ( CQ_ISNOTEMPTY(MsgRxCh2Buf) )
+            {
+                CQ_GET(MsgRxCh1Buf, msg);
+                ret = &msg;
+            }
+#endif
+            break;
+        case MSG_TYPE_DATA3:
+#ifndef __DATA3_STREAM__
+            if ( CQ_ISNOTEMPTY(MsgRxCh3Buf) )
+            {
+                CQ_GET(MsgRxCh1Buf, msg);
+                ret = &msg;
+            }
+#endif
+            break;
+    }
+
+    return ret;
+}
+
+int MsgSend(int type, void* sendbuf, int bufsize)
+{
+    if ( MsgTypeIsCtrl(type) )
+    {
+        struct CtrlMessage ctrl;
+
+        ctrl.type_and_size = type;
+        ctrl.seq = bufsize;
+        ctrl.crc8 = crc8(&ctrl.type_and_size, 2);
+
+        if ( CQ_ISFULL(CtrlMsgTxQ) )
+            RETURN(-3);
+
+        CQ_PUT(CtrlMsgTxQ, ctrl);
+
+        int tx_q_size = CQ_USEDSIZE(CtrlMsgTxQ);
+    }
+    else
+    {
+        struct DataMessage temp;
+
+        if ( (bufsize <= 0) || bufsize>DATA_MSG_MAX_LEN )
+            RETURN(-1);
+
+        temp.type_and_size = type | bufsize;
+        temp.seq = CQ_REAR(DataMsgTxQ);
+        if ( sendbuf ) memcpy(temp.data, sendbuf, bufsize);
+        temp.crc8 = crc8(&temp.type_and_size, bufsize+2);
+
+        if ( !MsgConnect )
+            RETURN(-2);
+
+        if ( CQ_ISFULL(DataMsgTxQ) )
+            RETURN(-3);
+
+        CQ_PUT(DataMsgTxQ, temp);
+    }
+
+    MsgSendHandler();
+    return 0;
+}
+
+void MsgSendNAK(int last_recv_seq, int occur_step)
+{
+	DPRINTF(("MsgSendNAK(%i) at step %i", EXPECTED_NEXT_SEQ, occur_step));
+
+    if ( MsgConnect )
+    {
+        if ( last_recv_seq >= 0 )
+            MsgSend(MSG_TYPE_NAK, NULL, EXPECTED_NEXT_SEQ);
+        else
+            MsgSend(MSG_TYPE_NAK, NULL, RESEND_ALL_MSG_IN_Q);
+    }
+}
+
+void MsgRecvHandler(void)
+{
+
+}
+
+void MsgRecvIrqHandler(int ch)
+{
+    static unsigned char buf[DATA_MSG_MAX_LEN+6];
+    static unsigned char buf_len = 0;
+    static bool wait_esc_next_char = false;
+    static unsigned char msg_type, msg_size;
+    static unsigned char cur_recv_seq;
+    static int last_recv_seq = -1;
+    static enum { OCCUR_ERROR, WAIT_SOX, WAIT_TYPE, WAIT_SEQ, RECV_DATA_AND_CRC, WAIT_EOX } msg_state = WAIT_SOX;
+
+    if ( ch >= 0 )
+    {
+        WC(ch);
+
+        if ( ch == SOX )
+        {
+            // WAIT_SOX 상태가 아닌데 SOX를 갑자기 수신했다면 에러 상황이므로 NAK를 보낸다
+            if ( msg_state==WAIT_TYPE || (msg_state>WAIT_TYPE && MsgTypeIsData(msg_type)) )
+            {
+                MsgSendNAK(last_recv_seq, 0);
+            }
+
+            // SOX를 수신했으므로 각종 변수를 초기화해서 새로운 메시지를 받기 시작할 준비를 한다
+            buf[0] = ch;
+            buf_len = 1;
+            msg_state = WAIT_TYPE;
+            return;
+        }
+        else if ( ch >= 0x80 && ch != EOX && ch != ESC )
+        {
+            // SOX, EOX, ESC도 아닌데 0x80 이상의 데이터를 수신했다면 어떤 상황에서든 에러이므로 NAK를 보낸다
+            if ( msg_state<=WAIT_TYPE || (msg_state>WAIT_TYPE && MsgTypeIsData(msg_type)) )
+            {
+                msg_state = OCCUR_ERROR;
+                MsgSendNAK(last_recv_seq, 1);
+            }
+        }
+
+        switch ( msg_state )
+        {
+            case OCCUR_ERROR:
+                // 새로운 SOX를 만날 때까지는 데이터를 수신하더라도 아무 일도 하지 않는다
+                break;
+
+            case WAIT_SOX:
+                // 만약 SOX가 왔다면 위쪽에서 처리되므로 여기에는 SOX 수신에 대한 처리를 따로 할 필요가 없다
+                if ( ch != SOX )
+                {
+                    msg_state = OCCUR_ERROR;
+                    MsgSendNAK(last_recv_seq, 2);
+                }
+                break;
+
+            case WAIT_TYPE:
+                // SOX, EOX, ESC도 false로 판단된다
+                if ( (MsgTypeIsData(ch) && GetMsgSize(ch)>0) || MsgTypeIsCtrl(ch) )
+                {
+                    msg_type = GetMsgType(ch);
+                    msg_size = GetMsgSize(ch);
+                    buf[buf_len++] = ch;
+                    msg_state = WAIT_SEQ;
+                }
+                else
+                {
+                    msg_state = OCCUR_ERROR;
+                    MsgSendNAK(last_recv_seq, 3);
+                }
+                break;
+
+            case WAIT_SEQ:
+                if ( ch == EOX || ch == ESC )
+                {
+                    msg_state = OCCUR_ERROR;
+                    // 이제부터 msg_type에 대해 정보를 알고 있으므로 msg_type이 Data인 경우에만 NAK를 보낸다
+                    if ( MsgTypeIsData(msg_type)  )
+                        MsgSendNAK(last_recv_seq, 4);
+                }
+                // msg_type이 Control인 경우에는 cur_recv_seq는 RESEND_ALL_MSG_IN_Q이 될 수도 있다
+                else if ( ch >= ARRAYSIZE(DataMsgTxQ) && (MsgTypeIsData(msg_type) || ch != RESEND_ALL_MSG_IN_Q) )
+                {
+                    msg_state = OCCUR_ERROR;
+                    // 이제부터 msg_type에 대해 정보를 알고 있으므로 msg_type이 Data인 경우에만 NAK를 보낸다
+                    if ( MsgTypeIsData(msg_type) )
+                        MsgSendNAK(last_recv_seq, 5);
+                }
+                else
+                {
+                    cur_recv_seq = ch;
+                    buf[buf_len++] = ch;
+
+                    // 보내온 cur_recv_seq가 last_recv_seq와 연속되지 않은 경우
+                    if ( MsgTypeIsData(msg_type) && last_recv_seq>=0 && cur_recv_seq!=EXPECTED_NEXT_SEQ )
+                    {
+                        msg_state = OCCUR_ERROR;
+                        // 이제 cur_recv_seq에 대해서도 알고 있으므로 바로 직전 seq가 다시 날라온 경우에는 NAK를 보내지 않는다.
+                        // 이것에 대해 NAK를 보내는 경우 NAK가 무한반복될 수 있다.
+                        if ( MsgTypeIsData(msg_type) && cur_recv_seq!=last_recv_seq )
+                        {
+                            MsgSendNAK(last_recv_seq, 8);
+                            /*
+                            WI(cur_recv_seq);
+                            WI(last_recv_seq);
+                            */
+                        }
+                    }
+                    else
+                    {
+                        msg_state = RECV_DATA_AND_CRC;
+                        wait_esc_next_char = false;
+                    }
+                }
+                break;
+
+            case RECV_DATA_AND_CRC:
+                if ( ch == EOX )
+                {
+                    msg_state = OCCUR_ERROR;
+                    if ( MsgTypeIsData(msg_type) ) MsgSendNAK(last_recv_seq, 6);
+                        return;
+                }
+                else if ( ch == ESC )
+                {
+                    wait_esc_next_char = true;
+                    break;
+                }
+                else if ( wait_esc_next_char )
+                {
+                    ch ^= 0x80;
+                }
+
+                buf[buf_len++] = ch;
+                wait_esc_next_char = false;
+
+                if ( buf_len == msg_size+4 ) // sox, cmd, seq, (buf), crc까지 모두 수신한 상태
+                {
+                    if ( buf[buf_len-1] != crc8(buf+1, msg_size+2) ) // crc 체크 실패
+                    {
+                        msg_state = OCCUR_ERROR;
+                        // 이제 cur_recv_seq에 대해서도 알고 있으므로 바로 직전 seq가 다시 날라온 경우에는 NAK를 보내지 않는다.
+                        // 이것에 대해 NAK를 보내는 경우 NAK가 무한반복될 수 있다.
+                        if ( MsgTypeIsData(msg_type) && cur_recv_seq!=last_recv_seq )
+                        {
+                            MsgSendNAK(last_recv_seq, 7);
+                            /*
+                            // CRC 계산이 정확하게 되었는지 확인하기 위해서 실제 수신한 데이터를 출력해본다
+                            for ( int i=0 ; i<buf_len ; i++ )
+                            {
+                                DPRINTF(("buf[%i]: '%c' (0x%02x)\r\n", i, buf[i]<=127 ? buf[i] : ' ', buf[i]));
+                            }
+                            WI(crc8(buf+1, msg_size+2));
+                            */
+                        }
+                    }
+                    else
+                    {
+                        msg_state = WAIT_EOX;
+                    }
+                }
+                break;
+
+            case WAIT_EOX:
+                if ( ch == EOX )
+                {
+                    msg_state = WAIT_SOX;
+                    if ( MsgConnect )
+                    {
+                        if ( MsgTypeIsData(msg_type) )
+                        {
+                            // cur_recv_seq를 성공적으로 수신하였으므로 ACK를 보낸다
+                            MsgSend(MSG_TYPE_ACK, NULL, cur_recv_seq);
+                            last_recv_seq = cur_recv_seq;
+                        }
+                        goto process_packet;
+                    }
+                    else if ( msg_type==MSG_TYPE_CONN || msg_type==MSG_TYPE_REQ_CONN ) // Connect 상태가 아닌 경우 Connect 관련 메시지 이외에는 무시한다.
+                    {
+                        goto process_packet;
+                    }
+                }
+                else
+                {
+                    msg_state = OCCUR_ERROR;
+                    if ( MsgTypeIsData(msg_type) )
+                        MsgSendNAK(last_recv_seq, 8);
+                }
+                break;
+        }
+    }
+
+    return;
+
+process_packet:
+    switch ( msg_type )
+    {
+        case MSG_TYPE_REQ_CONN:
+            DPUTS("<<--: REQ_CONN");
+            MsgConnect = false;
+            MsgSend(MSG_TYPE_CONN, NULL, 0);
+            MsgSend(MSG_TYPE_CONN, NULL, 0);
+            break;
+
+        case MSG_TYPE_CONN:
+            DPUTS("<<--: CONN");
+            if ( MsgConnect == false )
+            {
+                DPUTS("CONNECTION ESTABLISHED!!");
+                last_recv_seq = -1;
+                MsgInit();
+                MsgSend(MSG_TYPE_CONN, NULL, 0);
+                MsgSend(MSG_TYPE_CONN, NULL, 0);
+                MsgConnect = true;
+            }
+            break;
+
+        case MSG_TYPE_NAK:
+            if ( CQ_PTR_ISVALID(DataMsgTxQ, cur_recv_seq) ) // 현재 전송큐가 가지고 있는 시퀀스 범위 내라면
+            {
+                // NAK가 왔다는 것은 거부된 바로 직전 시퀀스까지는 송신성공된 것으로 판단하고 ACK처리를 한다.
+                unsigned char guess_ack_seq = CQ_DEC_PTR(DataMsgTxQ, cur_recv_seq);
+                if ( CQ_PTR_ISVALID(DataMsgTxQ, guess_ack_seq) )
+                {
+                    CQ_FRONT(DataMsgTxQ) = cur_recv_seq;
+                }
+
+                // NAK된 송신시퀀스부터 재전송한다.
+                DataMsgTxQSendPos = cur_recv_seq;
+
+                DPRINTF(("\t\t\t\t\t\t<<--: NAK resend from seq %i, q_use:%i/%i", cur_recv_seq, CQ_USEDSIZE(DataMsgTxQ), CQ_SIZE(DataMsgTxQ)));
+
+                // 재전송 시작 시퀀스를 이곳에 추가해야 한다
+            }
+            else if ( cur_recv_seq == RESEND_ALL_MSG_IN_Q )
+            {
+                // 현재 DataMsgTxQ에 남아있는 모든 메시지를 다시 보낸다
+                if ( CQ_ISNOTEMPTY(DataMsgTxQ) )
+                {
+                    DataMsgTxQSendPos = CQ_FRONT(DataMsgTxQ);
+                }
+
+                DPRINTF(("\t\t\t\t\t\t<<--: NAK resend ALL, q_use:%i/%i", CQ_USEDSIZE(DataMsgTxQ), CQ_SIZE(DataMsgTxQ)));
+            }
+            else
+            {
+                // 프로토콜 처리가 꼬여서 만약 이런 상황이 발생했다면 일단 아무 일도 하지 않는다
+                DPRINTF(("\t\t\t\t\t\t<<--: NAK out of seq (recv_seq:%i front:%i rear:%i)", cur_recv_seq, CQ_FRONT(DataMsgTxQ), CQ_REAR(DataMsgTxQ)));
+
+            }
+            break;
+
+        case MSG_TYPE_ACK:
+            if ( CQ_PTR_ISVALID(DataMsgTxQ, cur_recv_seq) )
+            {
+                CQ_FRONT(DataMsgTxQ) = CQ_INC_PTR(DataMsgTxQ, cur_recv_seq);
+
+                // MsgTxPosition이 시퀀스 범위 밖에 남아있는 경우 처리한다.
+                if ( !CQ_PTR_ISVALID(DataMsgTxQ, DataMsgTxQSendPos) )
+                    DataMsgTxQSendPos = CQ_FRONT(DataMsgTxQ);
+
+                DPRINTF(("\t\t\t\t\t\t<<--: ACK seq:%i, q_use:%i/%i", cur_recv_seq, CQ_USEDSIZE(DataMsgTxQ), CQ_SIZE(DataMsgTxQ)));
+            }
+            else
+            {
+                // 프로토콜 처리가 꼬여서 만약 이런 상황이 발생했다면 일단 아무 일도 하지 않는다
+                DPRINTF(("\t\t\t\t\t\t<<--: ACK out of seq (recv_seq:%i front:%i rear:%i)", cur_recv_seq, CQ_FRONT(DataMsgTxQ), CQ_REAR(DataMsgTxQ)));
+            }
+            break;
+
+        case MSG_TYPE_DATA1:
+            if ( CQ_FREESIZE(MsgRxCh1Buf) >= msg_size )
+            {
+#ifdef __DATA1_STREAM__
+                CQ_PUTBUF(MsgRxCh1Buf, &buf[3], msg_size);
+#else
+                struct RxMsg rxmsg;
+                memset(&rxmsg, 0, sizeof(rxmsg));
+                memcpy(rxmsg.data, &buf[3], msg_size);
+                CQ_PUT(MsgRxCh1Buf, rxmsg);
+#endif
+
+                DPRINTF(("<<--: RX CH1 %i bytes q_use:%i/%i", msg_size, CQ_USEDSIZE(MsgRxCh1Buf), ARRAYSIZE(MsgRxCh1Buf)));
+            }
+            else
+            {
+                ERROR("RX CH1 overflow");
+            }
+            break;
+
+        case MSG_TYPE_DATA2:
+            if ( CQ_FREESIZE(MsgRxCh2Buf) >= msg_size )
+            {
+#ifdef __DATA2_STREAM__
+                CQ_PUTBUF(MsgRxCh2Buf, &buf[3], msg_size);
+#else
+                struct RxMsg rxmsg;
+                memset(&rxmsg, 0, sizeof(rxmsg));
+                memcpy(rxmsg.data, &buf[3], msg_size);
+                CQ_PUT(MsgRxCh2Buf, rxmsg);
+#endif
+                DPRINTF(("<<--: RX CH2 %i bytes q_use:%i/%i", msg_size, CQ_USEDSIZE(MsgRxCh2Buf), ARRAYSIZE(MsgRxCh2Buf)));
+            }
+            else
+            {
+                ERROR("RX CH2 overflow");
+            }
+            break;
+
+        case MSG_TYPE_DATA3:
+            if ( CQ_FREESIZE(MsgRxCh3Buf) >= msg_size )
+            {
+#ifdef __DATA3_STREAM__
+                CQ_PUTBUF(MsgRxCh3Buf, &buf[3], msg_size);
+#else
+                struct RxMsg rxmsg;
+                memset(&rxmsg, 0, sizeof(rxmsg));
+                memcpy(rxmsg.data, &buf[3], msg_size);
+                CQ_PUT(MsgRxCh3Buf, rxmsg);
+#endif
+                DPRINTF(("<<--: RX CH3 %i bytes q_use:%i/%i", msg_size, CQ_USEDSIZE(MsgRxCh3Buf), ARRAYSIZE(MsgRxCh3Buf)));
+            }
+            else
+            {
+                ERROR("RX CH3 overflow");
+            }
+            break;
+
+        default:
+            DPRINTF(("<<--: UNKNOWN(0x%x) size:%i", msg_type, msg_size));
+            break;
+    }
+}
+
+
+void MsgSendHandler(void)
+{
+    #define SCI_TxByte(ch)  { write_buf[write_cnt++] = ch; }
+    #define HDLC_TxByte(ch) if ( (ch)==SOX || (ch)==EOX || (ch)==ESC ) { write_buf[write_cnt++] = ESC; write_buf[write_cnt++] = (ch)^0x80; } else { write_buf[write_cnt++] = ch; }
+
+	static int write_cnt;
+	static unsigned char write_buf[100];
+    static int retrans_cnt = 0;
+    static unsigned long last_data_msg_send_tick = 0;
+    static unsigned long last_req_conn_tick = 0;
+
+    // 이전 전송이 완료되지 않은 상태에서는 MsgSendHandler()를 수행하지 않는다
+    // 어차피 전송이 완료되면서 발생하는 인터럽트 핸들러에서 또다시 MsgSendHandler()가 호출될 것이기 때문이다
+    if ( MsgSendIrqIsOver == false )
+        return;
+
+    // 크리티컬 섹션으로 중복 실행을 원천 방지한다
+    // MsgSendHandler()는 호출 경로가 다양하므로 중복 실행될 경우 꼬일 가능성이 있다
+    taskENTER_CRITICAL();
+
+    if ( CQ_ISNOTEMPTY(CtrlMsgTxQ) )
+    {
+        struct CtrlMessage ctrl_msg;
+
+        CQ_GET(CtrlMsgTxQ, ctrl_msg);
+
+        switch ( ctrl_msg.type_and_size )
+        {
+            case MSG_TYPE_ACK:
+                DPRINTF(("-->>: ACK seq:%i", ctrl_msg.seq));
+                break;
+            case MSG_TYPE_NAK:
+                DPRINTF(("-->>: NAK seq:%i", ctrl_msg.seq));
+                break;
+            case MSG_TYPE_REQ_CONN:
+                DPRINTF(("-->>: REQ_CONN"));
+                break;
+            case MSG_TYPE_CONN:
+                DPRINTF(("-->>: CONN"));
+                break;
+        }
+
+        if ( ctrl_msg.type_and_size==MSG_TYPE_REQ_CONN || ctrl_msg.type_and_size==MSG_TYPE_CONN )
+            last_req_conn_tick = gTick;
+
+        write_cnt = 0;
+        SCI_TxByte(SOX);
+        SCI_TxByte(ctrl_msg.type_and_size);
+        SCI_TxByte(ctrl_msg.seq);
+        HDLC_TxByte(ctrl_msg.crc8);
+        SCI_TxByte(EOX);
+
+        MsgWriteToDMA(write_buf, write_cnt);
+    }
+
+    if ( MsgConnect )
+    {
+        int already_tx_count = CQ_COUNT(DataMsgTxQ, CQ_FRONT(DataMsgTxQ), DataMsgTxQSendPos); // 이미 보냈지만 아직 ACK를 받지 못한 전송 메시지의 갯수
+
+        if ( DataMsgTxQSendPos!=CQ_REAR(DataMsgTxQ) && already_tx_count<20 ) // 아직 ACK를 받지 못한 전송 메시지가 20개 이하인 경우
+        {
+            struct DataMessage data_msg;
+
+            data_msg = DataMsgTxQ[DataMsgTxQSendPos];
+            DataMsgTxQSendPos = CQ_INC_PTR(DataMsgTxQ, DataMsgTxQSendPos);
+            int not_tx_count = CQ_COUNT(DataMsgTxQ, DataMsgTxQSendPos, CQ_REAR(DataMsgTxQ));
+
+            DPRINTF(("\t\t\t\t\t\t-->>: DATA seq:%i, not_tx:%i, q_use:%i/%i", data_msg.seq, not_tx_count, CQ_USEDSIZE(DataMsgTxQ), CQ_SIZE(DataMsgTxQ)));
+
+            write_cnt = 0;
+            SCI_TxByte(SOX);
+            SCI_TxByte(data_msg.type_and_size);
+            SCI_TxByte(data_msg.seq);
+            for ( int i=0, size = GetMsgSize(data_msg.type_and_size) ; i<size ; i++ )
+                HDLC_TxByte(data_msg.data[i]);
+            HDLC_TxByte(data_msg.crc8);
+            SCI_TxByte(EOX);
+
+            MsgWriteToDMA(write_buf, write_cnt);
+            last_data_msg_send_tick = gTick;
+        }
+        else if ( CQ_ISNOTEMPTY(DataMsgTxQ) ) // ACK를 못받아서 TxQ에 남겨진 데이터가 있다면
+        {
+            if ( last_data_msg_send_tick>0 && TICK_FROM(last_data_msg_send_tick)>=500 ) // 마지막 데이터 전송으로부터 500ms 이상 대기
+            {
+                if ( retrans_cnt++ < 12 ) // 12번 재시도한다
+                {
+                    DPRINTF(("\t\t\t\t\t\t-->>: START RETRANS: %i", retrans_cnt));
+
+                    if ( CQ_FRONT(DataMsgTxQ) != DataMsgTxQSendPos  )
+                    {
+                        // 마지막 것을 재전송한다
+                        DataMsgTxQSendPos = CQ_DEC_PTR(DataMsgTxQ, DataMsgTxQSendPos);
+                    }
+                }
+                else // 연결이 끊어진 것으로 간주
+                {
+                    retrans_cnt = 0;
+                    last_data_msg_send_tick = 0;
+                    MsgConnect = false;
+                    MsgSend(MSG_TYPE_REQ_CONN, NULL, 0);
+                }
+            }
+        }
+        else
+        {
+            if ( retrans_cnt > 0 )
+            {
+                DPRINTF(("\t\t\t\t\t\t-->>: RESET RETRANS COUNT"));
+                retrans_cnt = 0;
+            }
+        }
+    }
+    else // if ( MsgConnect == false )
+    {
+        // REQ_CONN을 반복해서 보낸다.
+        if ( last_req_conn_tick>0 && TICK_FROM(last_req_conn_tick)>=500 ) // 500ms
+            MsgSend(MSG_TYPE_REQ_CONN, NULL, 0);
+    }
+
+    taskEXIT_CRITICAL();
+    return;
+}
+
+void MsgSendIrqHandler(void)
+{
+    MsgSendIrqIsOver = true;
+    MsgSendHandler();
+}
